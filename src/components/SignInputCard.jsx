@@ -2,6 +2,15 @@ import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { Camera, CameraOff, Scan, RotateCcw, Play, Square, Users, Sparkles, Type, Hash, MessageSquare, Space, Delete, Clock, CheckCircle2 } from 'lucide-react';
 import { classifyHands, ALPHABET_A_TO_Z, NUMBERS_0_TO_10, FULL_SIGN_VOCABULARY, distance } from '../utils/signClassifier';
 import { uniSignStreamProcessor } from '../utils/uniSignEngine';
+import {
+  CAMERA_STATES,
+  getCameraConstraints,
+  getFriendlyCameraError,
+  getMediaPipeStatus,
+  hasCameraApi,
+  stopMediaStream,
+  waitForVideoReady
+} from '../utils/cameraLifecycle';
 
 export default function SignInputCard({
   signLanguage,
@@ -22,8 +31,10 @@ export default function SignInputCard({
 }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
+  const [cameraState, setCameraState] = useState(CAMERA_STATES.IDLE);
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState(null);
+  const [recognitionState, setRecognitionState] = useState('checking');
   const [currentGesture, setCurrentGesture] = useState(null);
   const [detectionConfidence, setDetectionConfidence] = useState(0);
   const [targetSecondPerson, setTargetSecondPerson] = useState(false);
@@ -55,6 +66,8 @@ export default function SignInputCard({
   const recentDetectionsRef = useRef([]);
   const lastEmittedSignRef = useRef(null);
   const lastEmittedTimeRef = useRef(0);
+  const isMountedRef = useRef(true);
+  const startRequestIdRef = useRef(0);
 
   // Candidate hold tracker ref (requires steady holding before emitting)
   const candidateRef = useRef({
@@ -80,13 +93,73 @@ export default function SignInputCard({
   const onHandsResultsRef = useRef(null);
   const onPoseResultsRef = useRef(null);
 
+  const loadScript = useCallback((src) => new Promise((resolve, reject) => {
+    if (typeof document === 'undefined') {
+      reject(new Error('Document is not available.'));
+      return;
+    }
+
+    const existingScript = document.querySelector(`script[src="${src}"]`);
+    if (existingScript) {
+      if (existingScript.dataset.loaded === 'true') {
+        resolve();
+        return;
+      }
+
+      existingScript.addEventListener('load', () => {
+        existingScript.dataset.loaded = 'true';
+        resolve();
+      }, { once: true });
+      existingScript.addEventListener('error', () => reject(new Error(`Failed to load MediaPipe script: ${src}`)), { once: true });
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.src = src;
+    script.crossOrigin = 'anonymous';
+    script.async = true;
+    script.onload = () => {
+      script.dataset.loaded = 'true';
+      resolve();
+    };
+    script.onerror = () => reject(new Error(`Failed to load MediaPipe script: ${src}`));
+    document.head.appendChild(script);
+  }), []);
+
   /**
-   * Robust model loader that safely initializes MediaPipe Hands & Pose
+   * Robust model loader that safely initializes MediaPipe Hands & Pose.
+   * It verifies script availability explicitly and handles CDN failures gracefully.
    */
   const ensureModelsLoaded = useCallback(async () => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined') return false;
 
-    // Initialize Hands
+    const status = getMediaPipeStatus(window);
+    if (status.ready) {
+      setRecognitionState('ready');
+      return true;
+    }
+
+    setRecognitionState('loading');
+
+    try {
+      const scriptMap = [
+        'https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js',
+        'https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js',
+        'https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js'
+      ];
+
+      await Promise.all(scriptMap.map((src) => loadScript(src)));
+    } catch (error) {
+      console.error('MediaPipe resource loading failed:', error);
+      setRecognitionState('unavailable');
+      throw new Error('MediaPipe recognition dependencies could not be loaded.');
+    }
+
+    if (!window.Hands || !window.Pose) {
+      setRecognitionState('unavailable');
+      throw new Error('MediaPipe Hands and Pose were not available after script load.');
+    }
+
     if (!handsModelRef.current && window.Hands) {
       try {
         const hands = new window.Hands({
@@ -107,10 +180,10 @@ export default function SignInputCard({
         handsModelRef.current = hands;
       } catch (err) {
         console.error('Hands initialization error:', err);
+        throw err;
       }
     }
 
-    // Initialize Pose (optional body/face anchors)
     if (!poseModelRef.current && window.Pose) {
       try {
         const pose = new window.Pose({
@@ -133,7 +206,11 @@ export default function SignInputCard({
         console.warn('Pose initialization warning:', err);
       }
     }
-  }, []);
+
+    const finalStatus = getMediaPipeStatus(window);
+    setRecognitionState(finalStatus.ready ? 'ready' : 'unavailable');
+    return finalStatus.ready;
+  }, [loadScript]);
 
   const stopCamera = useCallback(() => {
     cameraActiveRef.current = false;
@@ -145,10 +222,12 @@ export default function SignInputCard({
       cameraUtilRef.current.stop();
       cameraUtilRef.current = null;
     }
-    if (videoRef.current && videoRef.current.srcObject) {
-      const tracks = videoRef.current.srcObject.getTracks();
-      tracks.forEach(track => track.stop());
+    if (videoRef.current) {
+      if (videoRef.current.srcObject) {
+        stopMediaStream(videoRef.current.srcObject);
+      }
       videoRef.current.srcObject = null;
+      videoRef.current.pause?.();
     }
     if (pauseTriggerTimeoutRef.current) {
       clearTimeout(pauseTriggerTimeoutRef.current);
@@ -168,6 +247,7 @@ export default function SignInputCard({
     };
     clipBufferRef.current = [];
     setBufferFillCount(0);
+    setCameraState(CAMERA_STATES.IDLE);
     setCameraActive(false);
     setCurrentGesture(null);
     setCandidateGesture(null);
@@ -180,16 +260,23 @@ export default function SignInputCard({
   }, [onStopSession]);
 
   useEffect(() => {
-    ensureModelsLoaded();
+    isMountedRef.current = true;
+    void ensureModelsLoaded().catch(() => {
+      if (isMountedRef.current) {
+        setCameraError('MediaPipe model assets could not be loaded. Recognition will remain unavailable until the page is refreshed.');
+      }
+    });
+
     const timer = setInterval(() => {
-      if (!handsModelRef.current) {
-        ensureModelsLoaded();
+      if (!handsModelRef.current && isMountedRef.current) {
+        void ensureModelsLoaded().catch(() => undefined);
       } else {
         clearInterval(timer);
       }
     }, 400);
 
     return () => {
+      isMountedRef.current = false;
       clearInterval(timer);
       stopCamera();
     };
@@ -610,104 +697,132 @@ export default function SignInputCard({
   }, [onHandsResults]);
 
   /**
-   * Start camera with robust universal getUserMedia and resilient frame driving loop
+   * Start camera with robust universal getUserMedia and resilient frame driving loop.
    */
-  const startCamera = async (customTargetSecondPerson) => {
+  const startCamera = useCallback(async (customTargetSecondPerson) => {
     const isSecondPerson = customTargetSecondPerson !== undefined ? customTargetSecondPerson : targetSecondPerson;
-    setCameraError(null);
-    try {
-      await ensureModelsLoaded();
+    const requestId = ++startRequestIdRef.current;
 
-      // Universal getUserMedia configuration that works reliably on Macs, PCs, and Phones
+    if (!isMountedRef.current) return;
+    if (!hasCameraApi()) {
+      setCameraState(CAMERA_STATES.ERROR);
+      setCameraError('This browser does not support webcam access. Please use a modern browser with camera support.');
+      return;
+    }
+
+    if (cameraState === CAMERA_STATES.REQUESTING_PERMISSION || cameraState === CAMERA_STATES.INITIALIZING || cameraState === CAMERA_STATES.STOPPING) {
+      return;
+    }
+
+    setCameraError(null);
+    setCameraState(CAMERA_STATES.REQUESTING_PERMISSION);
+
+    try {
+      const isMediaPipeReady = await ensureModelsLoaded();
+      if (!isMediaPipeReady) {
+        throw new Error('MediaPipe recognition dependencies are unavailable.');
+      }
+
+      setCameraState(CAMERA_STATES.INITIALIZING);
+
       let stream = null;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: { ideal: 1280, min: 640 },
-            height: { ideal: 720, min: 480 },
-            facingMode: isSecondPerson ? { ideal: 'environment' } : { ideal: 'user' }
-          },
-          audio: false
-        });
-      } catch (err1) {
-        console.warn('Constrained getUserMedia failed, falling back to basic video:', err1);
+        stream = await navigator.mediaDevices.getUserMedia(getCameraConstraints(!isSecondPerson));
+      } catch (firstError) {
+        console.warn('Constrained getUserMedia failed, falling back to basic video:', firstError);
         stream = await navigator.mediaDevices.getUserMedia({
           video: true,
           audio: false
         });
       }
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-
-        // Ensure video is ready before triggering play
-        await new Promise((resolve) => {
-          if (videoRef.current.readyState >= 2) {
-            resolve();
-          } else {
-            videoRef.current.onloadeddata = () => resolve();
-            videoRef.current.onloadedmetadata = () => resolve();
-            setTimeout(resolve, 600); // 600ms fallback
-          }
-        });
-
-        try {
-          await videoRef.current.play();
-        } catch (playErr) {
-          console.warn('Video play warning:', playErr);
-        }
-
-        cameraActiveRef.current = true;
-        setCameraActive(true);
-        onStartSession?.();
-
-        // High-reliability frame loop: sequential, non-colliding
-        const runFrameLoop = async () => {
-          if (!cameraActiveRef.current) return;
-
-          const video = videoRef.current;
-          if (video && video.readyState >= 2 && !isSendingFrameRef.current) {
-            isSendingFrameRef.current = true;
-
-            // 1. Send frame to Hands detector
-            try {
-              if (handsModelRef.current) {
-                await handsModelRef.current.send({ image: video });
-              }
-            } catch (err) {
-              console.warn('Hands frame send warning:', err);
-            }
-
-            // 2. Send frame to Pose detector (sequential, never concurrent)
-            try {
-              if (poseModelRef.current) {
-                await poseModelRef.current.send({ image: video });
-              }
-            } catch (err) {
-              // Pose is auxiliary, do not let it block Hands
-            } finally {
-              isSendingFrameRef.current = false;
-            }
-          }
-
-          if (cameraActiveRef.current) {
-            frameLoopIdRef.current = requestAnimationFrame(runFrameLoop);
-          }
-        };
-
-        // Cancel any lingering frame loop before starting new one
-        if (frameLoopIdRef.current) {
-          cancelAnimationFrame(frameLoopIdRef.current);
-        }
-        frameLoopIdRef.current = requestAnimationFrame(runFrameLoop);
+      if (requestId !== startRequestIdRef.current) {
+        stopMediaStream(stream);
+        return;
       }
+
+      if (!videoRef.current) {
+        stopMediaStream(stream);
+        throw new Error('Video element was not ready when the camera stream was acquired.');
+      }
+
+      videoRef.current.srcObject = stream;
+      videoRef.current.muted = true;
+      videoRef.current.autoplay = true;
+      videoRef.current.playsInline = true;
+
+      try {
+        await waitForVideoReady(videoRef.current, 2000);
+      } catch (videoError) {
+        stopMediaStream(stream);
+        throw videoError;
+      }
+
+      try {
+        await videoRef.current.play();
+      } catch (playError) {
+        console.warn('Video playback warning:', playError);
+      }
+
+      if (requestId !== startRequestIdRef.current) {
+        stopMediaStream(stream);
+        return;
+      }
+
+      cameraActiveRef.current = true;
+      setCameraState(CAMERA_STATES.ACTIVE);
+      setCameraActive(true);
+      onStartSession?.();
+
+      const runFrameLoop = async () => {
+        if (!cameraActiveRef.current || requestId !== startRequestIdRef.current) return;
+
+        const video = videoRef.current;
+        if (video && video.readyState >= 2 && !isSendingFrameRef.current) {
+          isSendingFrameRef.current = true;
+
+          try {
+            if (handsModelRef.current) {
+              await handsModelRef.current.send({ image: video });
+            }
+          } catch (err) {
+            console.warn('Hands frame send warning:', err);
+          }
+
+          try {
+            if (poseModelRef.current) {
+              await poseModelRef.current.send({ image: video });
+            }
+          } catch (err) {
+            // Pose is auxiliary and should never block the active camera feed.
+          } finally {
+            isSendingFrameRef.current = false;
+          }
+        }
+
+        if (cameraActiveRef.current && requestId === startRequestIdRef.current) {
+          frameLoopIdRef.current = requestAnimationFrame(runFrameLoop);
+        }
+      };
+
+      if (frameLoopIdRef.current) {
+        cancelAnimationFrame(frameLoopIdRef.current);
+      }
+      frameLoopIdRef.current = requestAnimationFrame(runFrameLoop);
     } catch (err) {
+      const message = getFriendlyCameraError(err, 'Could not access the camera. Please allow webcam permissions in your browser.');
       console.error('Camera access error:', err);
-      setCameraError(err.message || 'Could not access camera. Please allow webcam permissions in your browser.');
+      if (videoRef.current) {
+        stopMediaStream(videoRef.current.srcObject);
+        videoRef.current.srcObject = null;
+        videoRef.current.pause?.();
+      }
+      setCameraError(message);
+      setCameraState(CAMERA_STATES.ERROR);
       cameraActiveRef.current = false;
       setCameraActive(false);
     }
-  };
+  }, [cameraState, ensureModelsLoaded, onStartSession, targetSecondPerson]);
 
 
   const handleSimulateGesture = (item) => {
@@ -732,6 +847,16 @@ export default function SignInputCard({
   const filteredVocabulary = selectedCategory === 'All'
     ? FULL_SIGN_VOCABULARY
     : FULL_SIGN_VOCABULARY.filter(item => item.category === selectedCategory);
+
+  const cameraStatusLabel = cameraState === CAMERA_STATES.REQUESTING_PERMISSION
+    ? 'REQUESTING'
+    : cameraState === CAMERA_STATES.INITIALIZING
+      ? 'INITIALIZING'
+      : cameraState === CAMERA_STATES.ERROR
+        ? 'ERROR'
+        : cameraActive
+          ? 'LIVE'
+          : 'CAMERA OFF';
 
   return (
     <div style={{
@@ -912,7 +1037,7 @@ export default function SignInputCard({
           fontSize: '11px',
           fontWeight: 600,
           letterSpacing: '0.08em',
-          color: cameraActive ? 'var(--accent-green)' : 'var(--text-muted)',
+          color: cameraState === CAMERA_STATES.ERROR ? '#f87171' : cameraActive ? 'var(--accent-green)' : 'var(--text-muted)',
           zIndex: 10,
           flexWrap: 'wrap'
         }}>
@@ -921,10 +1046,10 @@ export default function SignInputCard({
               width: '6px',
               height: '6px',
               borderRadius: '50%',
-              backgroundColor: cameraActive ? 'var(--accent-green)' : 'var(--text-muted)',
+              backgroundColor: cameraState === CAMERA_STATES.ERROR ? '#f87171' : cameraActive ? 'var(--accent-green)' : 'var(--text-muted)',
               boxShadow: cameraActive ? '0 0 8px var(--accent-green)' : 'none'
             }} />
-            <span>{cameraActive ? 'LIVE' : 'CAMERA OFF'}</span>
+            <span>{cameraStatusLabel}</span>
           </div>
 
           <span style={{ color: 'var(--border-strong)', margin: '0 2px' }}>|</span>
@@ -1180,29 +1305,48 @@ export default function SignInputCard({
             <button
               onClick={(e) => {
                 e.stopPropagation();
+                if (cameraState === CAMERA_STATES.REQUESTING_PERMISSION || cameraState === CAMERA_STATES.INITIALIZING) return;
                 startCamera();
               }}
+              disabled={cameraState === CAMERA_STATES.REQUESTING_PERMISSION || cameraState === CAMERA_STATES.INITIALIZING}
               style={{
                 display: 'flex',
                 alignItems: 'center',
                 gap: '10px',
-                backgroundColor: '#06b6d4',
+                backgroundColor: cameraState === CAMERA_STATES.ERROR ? '#f97316' : '#06b6d4',
                 color: '#ffffff',
                 border: 'none',
                 borderRadius: '999px',
                 padding: '14px 28px',
                 fontSize: '15px',
                 fontWeight: 600,
-                cursor: 'pointer',
+                cursor: cameraState === CAMERA_STATES.REQUESTING_PERMISSION || cameraState === CAMERA_STATES.INITIALIZING ? 'not-allowed' : 'pointer',
                 marginBottom: '16px',
                 boxShadow: '0 4px 20px rgba(6, 182, 212, 0.4)',
-                transition: 'all 0.2s ease'
+                transition: 'all 0.2s ease',
+                opacity: cameraState === CAMERA_STATES.REQUESTING_PERMISSION || cameraState === CAMERA_STATES.INITIALIZING ? 0.8 : 1
               }}
-              onMouseEnter={e => e.currentTarget.style.backgroundColor = '#0891b2'}
-              onMouseLeave={e => e.currentTarget.style.backgroundColor = '#06b6d4'}
+              onMouseEnter={e => {
+                if (cameraState !== CAMERA_STATES.REQUESTING_PERMISSION && cameraState !== CAMERA_STATES.INITIALIZING) {
+                  e.currentTarget.style.backgroundColor = cameraState === CAMERA_STATES.ERROR ? '#ea580c' : '#0891b2';
+                }
+              }}
+              onMouseLeave={e => {
+                if (cameraState !== CAMERA_STATES.REQUESTING_PERMISSION && cameraState !== CAMERA_STATES.INITIALIZING) {
+                  e.currentTarget.style.backgroundColor = cameraState === CAMERA_STATES.ERROR ? '#f97316' : '#06b6d4';
+                }
+              }}
             >
               <Camera size={18} />
-              <span>Enable camera & Start Translating</span>
+              <span>
+                {cameraState === CAMERA_STATES.ERROR
+                  ? 'Retry Camera'
+                  : cameraState === CAMERA_STATES.REQUESTING_PERMISSION
+                    ? 'Requesting camera access...'
+                    : cameraState === CAMERA_STATES.INITIALIZING
+                      ? 'Starting camera...'
+                      : 'Enable camera & Start Translating'}
+              </span>
             </button>
 
             <div style={{
@@ -1227,6 +1371,18 @@ export default function SignInputCard({
                 color: '#f87171'
               }}>
                 {cameraError}
+              </div>
+            )}
+
+            {recognitionState !== 'ready' && (
+              <div style={{
+                marginTop: '12px',
+                fontSize: '11px',
+                color: 'var(--text-muted)',
+                letterSpacing: '0.05em',
+                textTransform: 'uppercase'
+              }}>
+                Recognition status: {recognitionState === 'loading' ? 'Loading' : recognitionState === 'unavailable' ? 'Unavailable' : 'Checking'}
               </div>
             )}
           </div>
