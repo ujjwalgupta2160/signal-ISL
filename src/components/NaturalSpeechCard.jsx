@@ -22,6 +22,7 @@ export default function NaturalSpeechCard({
         // Try to find a nice expressive voice like Aria, Guy, Jenny, Google, or default
         const preferred = avail.find(v => v.name.includes('Aria') || v.name.includes('Jenny') || v.name.includes('Natural') || v.lang.startsWith('en')) || avail[0];
         setSelectedVoiceURI(preferred.voiceURI);
+        uniSignSpeechConverter.setVoice(preferred.voiceURI);
       }
     };
 
@@ -122,7 +123,11 @@ export default function NaturalSpeechCard({
           </label>
           <select
             value={selectedVoiceURI}
-            onChange={(e) => setSelectedVoiceURI(e.target.value)}
+            onChange={(e) => {
+              const uri = e.target.value;
+              setSelectedVoiceURI(uri);
+              uniSignSpeechConverter.setVoice(uri);
+            }}
             style={{
               width: '100%',
               backgroundColor: 'var(--bg-card-subtle)',
@@ -159,7 +164,11 @@ export default function NaturalSpeechCard({
           </label>
           <select
             value={speed}
-            onChange={(e) => setSpeed(parseFloat(e.target.value))}
+            onChange={(e) => {
+              const val = parseFloat(e.target.value);
+              setSpeed(val);
+              uniSignSpeechConverter.setRate(val);
+            }}
             style={{
               width: '100%',
               backgroundColor: 'var(--bg-card-subtle)',
@@ -233,7 +242,11 @@ export default function NaturalSpeechCard({
             max="1"
             step="0.05"
             value={volume}
-            onChange={(e) => setVolume(parseFloat(e.target.value))}
+            onChange={(e) => {
+              const val = parseFloat(e.target.value);
+              setVolume(val);
+              uniSignSpeechConverter.setVolume(val);
+            }}
             style={{
               width: '90px',
               height: '4px',

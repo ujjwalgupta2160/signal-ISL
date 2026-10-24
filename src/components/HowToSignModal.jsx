@@ -31,8 +31,8 @@ export default function HowToSignModal({ isOpen, onClose, onSelectSign, initialL
   // Filter based on search query and active section
   const filteredItems = allItems.filter(item => {
     const matchesSearch = searchQuery.trim() === '' ||
-      item.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      item.description.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (item.name && item.name.toLowerCase().includes(searchQuery.toLowerCase())) ||
+      (item.description && item.description.toLowerCase().includes(searchQuery.toLowerCase())) ||
       (item.phrase && item.phrase.toLowerCase().includes(searchQuery.toLowerCase())) ||
       (item.hindiPhrase && item.hindiPhrase.includes(searchQuery));
 

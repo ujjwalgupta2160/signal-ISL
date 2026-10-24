@@ -4,7 +4,7 @@
 // Subgraphs: body (9 nodes), left hand (21 nodes), right hand (21 nodes), face_all (18 nodes)
 // Replaces external cloud APIs with fully autonomous, offline, high-precision Uni-Sign inference
 
-import { distance, analyzeFingerDetails, classifyAlphabet, classifyNumber } from './signClassifier';
+import { distance, analyzeFingerDetails, classifyAlphabet, classifyNumber } from './signClassifier.js';
 
 /**
  * Uni-Sign Graph Topology Definitions from Uni-Sign stgcn_layers/gcn_utils.py

@@ -17,7 +17,8 @@ export default function SignInputCard({
   setInputMode,
   onFingerspellLetter,
   onFingerspellSpace,
-  onFingerspellBackspace
+  onFingerspellBackspace,
+  sensitivity = 70
 }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -25,7 +26,7 @@ export default function SignInputCard({
   const [cameraError, setCameraError] = useState(null);
   const [currentGesture, setCurrentGesture] = useState(null);
   const [detectionConfidence, setDetectionConfidence] = useState(0);
-  const [targetSecondPerson, setTargetSecondPerson] = useState(true);
+  const [targetSecondPerson, setTargetSecondPerson] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState('All');
 
   // Hold-to-Confirm steady recognition states (gives user time to show sign)
@@ -134,6 +135,50 @@ export default function SignInputCard({
     }
   }, []);
 
+  const stopCamera = useCallback(() => {
+    cameraActiveRef.current = false;
+    if (frameLoopIdRef.current) {
+      cancelAnimationFrame(frameLoopIdRef.current);
+      frameLoopIdRef.current = null;
+    }
+    if (cameraUtilRef.current) {
+      cameraUtilRef.current.stop();
+      cameraUtilRef.current = null;
+    }
+    if (videoRef.current && videoRef.current.srcObject) {
+      const tracks = videoRef.current.srcObject.getTracks();
+      tracks.forEach(track => track.stop());
+      videoRef.current.srcObject = null;
+    }
+    if (pauseTriggerTimeoutRef.current) {
+      clearTimeout(pauseTriggerTimeoutRef.current);
+      pauseTriggerTimeoutRef.current = null;
+    }
+    if (confirmedTimeoutRef.current) {
+      clearTimeout(confirmedTimeoutRef.current);
+      confirmedTimeoutRef.current = null;
+    }
+    candidateRef.current = {
+      name: null,
+      sign: null,
+      startTime: 0,
+      lastSeenTime: 0,
+      consecutiveFrames: 0,
+      jitterFrames: 0
+    };
+    clipBufferRef.current = [];
+    setBufferFillCount(0);
+    setCameraActive(false);
+    setCurrentGesture(null);
+    setCandidateGesture(null);
+    setConfirmedGesture(null);
+    setHoldProgress(0);
+    setMotionState('idle');
+    setPoseDetected(false);
+    setHandCountDetected(0);
+    onStopSession?.();
+  }, [onStopSession]);
+
   useEffect(() => {
     ensureModelsLoaded();
     const timer = setInterval(() => {
@@ -148,7 +193,7 @@ export default function SignInputCard({
       clearInterval(timer);
       stopCamera();
     };
-  }, [ensureModelsLoaded]);
+  }, [ensureModelsLoaded, stopCamera]);
 
   /**
    * Listener for MediaPipe Pose (Head, Chin, Forehead, Shoulders, Chest)
@@ -162,7 +207,10 @@ export default function SignInputCard({
       setPoseDetected(false);
     }
   }, []);
-  onPoseResultsRef.current = onPoseResults;
+
+  useEffect(() => {
+    onPoseResultsRef.current = onPoseResults;
+  }, [onPoseResults]);
 
   /**
    * Finalize the signed thought using pure Uni-Sign (ICLR 2025) ST-GCN multi-frame sequence translation
@@ -435,8 +483,9 @@ export default function SignInputCard({
       // Run local classifier using both Hands and Pose anchors
       const detected = classifyHands(results.multiHandLandmarks, poseLandmarksRef.current, signLanguage, inputMode);
       const nowMs = Date.now();
-      // Hold duration: give user ample time to form & hold sign so system understands before implementing
-      const holdDuration = inputMode === 'alphabet' ? 850 : (inputMode === 'numbers' ? 900 : 1100);
+      // Hold duration adjusted dynamically by sensitivity: lower sensitivity -> more hold needed to ensure clarity
+      const baseHoldDuration = inputMode === 'alphabet' ? 850 : (inputMode === 'numbers' ? 900 : 1100);
+      const holdDuration = Math.round(baseHoldDuration * (1.4 - (sensitivity / 100) * 0.6));
 
       if (detected) {
         setCurrentGesture(detected);
@@ -496,6 +545,7 @@ export default function SignInputCard({
             cand.jitterFrames = (cand.jitterFrames || 0) + 1;
             if (cand.jitterFrames <= 2) {
               // Maintain current candidate during momentary transition noise
+              ctx.restore();
               return;
             }
           }
@@ -553,13 +603,17 @@ export default function SignInputCard({
     }
 
     ctx.restore();
-  }, [mirrorMode, targetSecondPerson, signLanguage, inputMode, processCompletedSigning, onGestureDetected]);
-  onHandsResultsRef.current = onHandsResults;
+  }, [mirrorMode, targetSecondPerson, signLanguage, inputMode, sensitivity, processCompletedSigning, onGestureDetected]);
+
+  useEffect(() => {
+    onHandsResultsRef.current = onHandsResults;
+  }, [onHandsResults]);
 
   /**
    * Start camera with robust universal getUserMedia and resilient frame driving loop
    */
-  const startCamera = async () => {
+  const startCamera = async (customTargetSecondPerson) => {
+    const isSecondPerson = customTargetSecondPerson !== undefined ? customTargetSecondPerson : targetSecondPerson;
     setCameraError(null);
     try {
       await ensureModelsLoaded();
@@ -571,7 +625,7 @@ export default function SignInputCard({
           video: {
             width: { ideal: 1280, min: 640 },
             height: { ideal: 720, min: 480 },
-            facingMode: targetSecondPerson ? { ideal: 'environment' } : { ideal: 'user' }
+            facingMode: isSecondPerson ? { ideal: 'environment' } : { ideal: 'user' }
           },
           audio: false
         });
@@ -655,48 +709,6 @@ export default function SignInputCard({
     }
   };
 
-  const stopCamera = () => {
-    cameraActiveRef.current = false;
-    if (frameLoopIdRef.current) {
-      cancelAnimationFrame(frameLoopIdRef.current);
-      frameLoopIdRef.current = null;
-    }
-    if (cameraUtilRef.current) {
-      cameraUtilRef.current.stop();
-      cameraUtilRef.current = null;
-    }
-    if (videoRef.current && videoRef.current.srcObject) {
-      const tracks = videoRef.current.srcObject.getTracks();
-      tracks.forEach(track => track.stop());
-      videoRef.current.srcObject = null;
-    }
-    if (pauseTriggerTimeoutRef.current) {
-      clearTimeout(pauseTriggerTimeoutRef.current);
-      pauseTriggerTimeoutRef.current = null;
-    }
-    if (confirmedTimeoutRef.current) {
-      clearTimeout(confirmedTimeoutRef.current);
-      confirmedTimeoutRef.current = null;
-    }
-    candidateRef.current = {
-      name: null,
-      sign: null,
-      startTime: 0,
-      lastSeenTime: 0,
-      consecutiveFrames: 0,
-      jitterFrames: 0
-    };
-    clipBufferRef.current = [];
-    setBufferFillCount(0);
-    setCameraActive(false);
-    setCurrentGesture(null);
-    setCandidateGesture(null);
-    setConfirmedGesture(null);
-    setHoldProgress(0);
-    setMotionState('idle');
-    setPoseDetected(false);
-    setHandCountDetected(0);
-  };
 
   const handleSimulateGesture = (item) => {
     const signObj = {
@@ -1401,7 +1413,14 @@ export default function SignInputCard({
           )}
 
           <button
-            onClick={() => setTargetSecondPerson(!targetSecondPerson)}
+            onClick={async () => {
+              const nextVal = !targetSecondPerson;
+              setTargetSecondPerson(nextVal);
+              if (cameraActiveRef.current) {
+                stopCamera();
+                setTimeout(() => startCamera(nextVal), 150);
+              }
+            }}
             title="Toggle between scanning a second person facing you vs yourself"
             style={{
               display: 'flex',
@@ -1682,7 +1701,10 @@ export default function SignInputCard({
 
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           <button
-            onClick={onResetSession}
+            onClick={() => {
+              stopCamera();
+              onResetSession();
+            }}
             style={{
               display: 'flex',
               alignItems: 'center',
@@ -1738,7 +1760,10 @@ export default function SignInputCard({
             </button>
           ) : (
             <button
-              onClick={onStopSession}
+              onClick={() => {
+                stopCamera();
+                onStopSession();
+              }}
               style={{
                 display: 'flex',
                 alignItems: 'center',

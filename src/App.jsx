@@ -222,6 +222,7 @@ export default function App() {
             onFingerspellLetter={handleFingerspellLetter}
             onFingerspellSpace={handleFingerspellSpace}
             onFingerspellBackspace={handleFingerspellBackspace}
+            sensitivity={sensitivity}
           />
 
           {/* Right Column: Detected Text & Natural Speech */}

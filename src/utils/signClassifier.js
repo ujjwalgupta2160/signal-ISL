@@ -2,7 +2,7 @@
 // Full Indian Sign Language (ISL) & American Sign Language (ASL)
 // Includes complete A-Z Fingerspelling, Numbers 0-10, and 100+ Vocabulary Signs (including Father, Mother, Family, Doctor)
 
-import { ALPHABET_A_TO_Z, NUMBERS_0_TO_10, FULL_SIGN_VOCABULARY } from './fullDictionary';
+import { ALPHABET_A_TO_Z, NUMBERS_0_TO_10, FULL_SIGN_VOCABULARY } from './fullDictionary.js';
 
 export { ALPHABET_A_TO_Z, NUMBERS_0_TO_10, FULL_SIGN_VOCABULARY };
 
